@@ -103,7 +103,7 @@ class Metabase_API():
         Use 'params' for providing arguments. E.g. to include tables in the result for databases, use: params={'include':'tables'}
         '''    
 
-        assert item_type in ['database', 'table', 'card', 'collection', 'dashboard', 'pulse', 'segment']
+        assert item_type in ['database', 'table', 'card', 'collection', 'dashboard', 'pulse', 'segment', 'field']
 
         if params:
             assert type(params) == dict
@@ -123,7 +123,7 @@ class Metabase_API():
 
     def get_item_name(self, item_type, item_id):
 
-        assert item_type in ['database', 'table', 'card', 'collection', 'dashboard', 'pulse', 'segment']
+        assert item_type in ['database', 'table', 'card', 'collection', 'dashboard', 'pulse', 'segment', 'field']
 
         res = self.get("/api/{}/{}".format(item_type, item_id))
         if res:
@@ -133,9 +133,9 @@ class Metabase_API():
 
 
 
-    def get_item_id(self, item_type, item_name, collection_id=None, collection_name=None, db_id=None, db_name=None, table_id=None):
+    def get_item_id(self, item_type, item_name, collection_id=None, collection_name=None, db_id=None, db_name=None, table_id=None, db_schema=None):
 
-        assert item_type in ['database', 'table', 'card', 'collection', 'dashboard', 'pulse', 'segment']
+        assert item_type in ['database', 'table', 'card', 'collection', 'dashboard', 'pulse', 'segment', 'field']
 
         if item_type in ['card', 'dashboard', 'pulse']:
             if not collection_id:
@@ -198,11 +198,13 @@ class Metabase_API():
             tables = self.get("/api/table/")
 
             if db_id:
-                table_IDs = [ i['id'] for i in tables if i['name'] == item_name and i['db']['id'] == db_id ]
+                table_IDs = [ i['id'] for i in tables if i['name'] == item_name and i['db']['id'] == db_id and (not db_schema or i['schema'] == db_schema) ]
             elif db_name:
-                table_IDs = [ i['id'] for i in tables if i['name'] == item_name and i['db']['name'] == db_name ]
+                table_IDs = [ i['id'] for i in tables if i['name'] == item_name and i['db']['name'] == db_name and (not db_schema or i['schema'] == db_schema)]
             else:
-                table_IDs = [ i['id'] for i in tables if i['name'] == item_name ]
+                table_IDs = [ i['id'] for i in tables if i['name'] == item_name and (not db_schema or i['schema'] == db_schema)]
+
+                
 
             if len(table_IDs) > 1:
                 raise ValueError('There is more than one table with the name {}. Provide db id/name.'.format(item_name))
@@ -459,6 +461,7 @@ class Metabase_API():
 
                 # Create the card using only the provided custom_json 
                 res = self.post("/api/card/", json=custom_json)
+                self.verbose_print(verbose, custom_json)
                 if res and not res.get('error'):
                     self.verbose_print(verbose, 'The card was created successfully.')
                     return res if return_card else None
@@ -646,7 +649,7 @@ class Metabase_API():
                   source_collection_name=None, source_collection_id=None,
                   destination_card_name=None, 
                   destination_collection_name=None, destination_collection_id=None,
-                  postfix='', verbose=False):
+                  destination_database_id=None, postfix='', verbose=False):
         """
         Copy the card with the given name/id to the given destination collection. 
 
@@ -659,6 +662,7 @@ class Metabase_API():
                                                          If None, it will use the name of the source card + postfix.
         destination_collection_name -- name of the collection to copy the card to (default None) 
         destination_collection_id -- id of the collection to copy the card to (default None) 
+        destination_database_id -- id of the database to connect the copy of the card to (default None) 
         postfix -- if destination_card_name is None, adds this string to the end of source_card_name 
                              to make destination_card_name
         """
@@ -690,6 +694,33 @@ class Metabase_API():
         card_json = source_card
         card_json['collection_id'] = destination_collection_id
         card_json['name'] = destination_card_name
+
+        if destination_database_id:
+             card_json['database_id'] = destination_database_id
+             card_json['dataset_query']['database'] = destination_database_id
+             
+             # Change fields filters to point to the new destination database
+             if 'native' in card_json['dataset_query']:
+                    field_filter_ids = [i[1]['dimension'][1] for i in card_json['dataset_query']['native']['template-tags'].items()
+                                        if i[1]['type'] == 'dimension']
+                    field_filters = [self.get_item_info(item_type='field', item_id=i) for i in field_filter_ids]
+
+                    # Get the table with the same name on the new db                        
+                    new_table_ids = [self.get_item_id(item_type='table', item_name=f['table']['name'], db_id=destination_database_id, db_schema=f['table']['schema']) 
+                                                for f in field_filters]
+
+                    new_table_info = [self.get_table_metadata(table_id=i) for i in new_table_ids]
+
+                    def get_new_field_id(old_filter, new_table):
+                        field_name = old_filter['name']
+                        return [f['id'] for f in new_table['fields'] if f['name'] == field_name].pop()
+
+                    field_map = {t[0]['id']: get_new_field_id(t[0],t[1]) for t in zip(field_filters, new_table_info)}
+
+                    for key in card_json['dataset_query']['native']['template-tags']:
+                        if card_json['dataset_query']['native']['template-tags'][key]['type'] == 'dimension':
+                            previous_field_id = card_json['dataset_query']['native']['template-tags'][key]['dimension'][1]
+                            card_json['dataset_query']['native']['template-tags'][key]['dimension'][1] = field_map[previous_field_id]
 
         # Fix the issue #10
         if card_json.get('description') == '': 
@@ -759,6 +790,7 @@ class Metabase_API():
                        source_collection_name=None, source_collection_id=None,
                        destination_dashboard_name=None, 
                        destination_collection_name=None, destination_collection_id=None,
+                       destination_database_id=None,
                        deepcopy=False, postfix=''):
         """
         Copy the dashboard with the given name/id to the given destination collection. 
@@ -819,7 +851,7 @@ class Metabase_API():
             source_dashboard_card_IDs = [ i['card_id'] for i in source_dashboard['ordered_cards'] if i['card_id'] is not None ]
             card_id_mapping = {}
             for card_id in source_dashboard_card_IDs:
-                dup_card_id = self.copy_card(source_card_id=card_id, destination_collection_id=cards_collection_id)
+                dup_card_id = self.copy_card(source_card_id=card_id, destination_collection_id=cards_collection_id, destination_database_id=destination_database_id)
                 card_id_mapping[card_id] = dup_card_id
 
             # replace cards in the duplicated dashboard with duplicated cards
@@ -851,7 +883,8 @@ class Metabase_API():
     def copy_collection(self, source_collection_name=None, source_collection_id=None, 
                         destination_collection_name=None,
                         destination_parent_collection_name=None, destination_parent_collection_id=None, 
-                        deepcopy_dashboards=False, postfix='', child_items_postfix='', verbose=False):
+                        destination_database_id=None, deepcopy_dashboards=False, postfix='',
+                        child_items_postfix='', verbose=False):
         """
         Copy the collection with the given name/id into the given destination parent collection. 
 
@@ -865,6 +898,7 @@ class Metabase_API():
                                                                                     use 'Root' for the root collection.
         destination_parent_collection_id -- id of the destination parent collection (default None).
                                                                                 This is the collection that would have the copied collection as a child.
+        destination_database_id -- id of the database to connect copied cards to (default None).
         deepcopy_dashboards -- whether to duplicate the cards inside the dashboards (default False). 
                                                      If True, puts the duplicated cards in a collection called "[dashboard_name]'s duplicated cards" 
                                                      in the same path as the duplicated dashboard.
@@ -920,6 +954,7 @@ class Metabase_API():
                                      destination_parent_collection_id=destination_collection_id,
                                      child_items_postfix=child_items_postfix,
                                      deepcopy_dashboards=deepcopy_dashboards,
+                                     destination_database_id=destination_database_id,
                                      verbose=verbose)
 
             ## copy a dashboard
@@ -931,7 +966,7 @@ class Metabase_API():
                 self.copy_dashboard(source_dashboard_id=dashboard_id,
                                     destination_collection_id=destination_collection_id,
                                     destination_dashboard_name=destination_dashboard_name,
-                                    deepcopy=deepcopy_dashboards)
+                                    deepcopy=deepcopy_dashboards, destination_database_id=destination_database_id)
 
             ## copy a card
             if item['model'] == 'card':
@@ -941,7 +976,8 @@ class Metabase_API():
                 self.verbose_print(verbose, 'Copying the card "{}" ...'.format(card_name))
                 self.copy_card(source_card_id=card_id,
                                destination_collection_id=destination_collection_id,
-                               destination_card_name=destination_card_name)
+                               destination_card_name=destination_card_name,
+                               destination_database_id=destination_database_id)
 
             ## copy a pulse
             if item['model'] == 'pulse':
@@ -1019,8 +1055,9 @@ class Metabase_API():
     def clone_card(self, card_id, 
                    source_table_id=None, target_table_id=None, 
                    source_table_name=None, target_table_name=None, 
-                   new_card_name=None, new_card_collection_id=None, 
-                   ignore_these_filters=None, return_card=False):
+                   new_card_name=None, new_card_collection_id=None,
+                   new_card_database_id=None, ignore_these_filters=None,
+                   return_card=False):
         """ 
         *** work in progress ***
         Create a new card where the source of the old card is changed from 'source_table_id' to 'target_table_id'. 
@@ -1035,6 +1072,7 @@ class Metabase_API():
         target_table_id -- The table that the filters of the cloned card would be based on
         new_card_name -- Name of the cloned card. If not provided, the name of the source card is used.
         new_card_collection_id -- The id of the collection that the cloned card should be saved in
+        new_card_database_id -- The id of the database that the cloned card should connect to
         ignore_these_filters -- A list of variable names of filters. The source of these filters would not change in the cloning process.
         return_card -- Whether to return the info of the created card (default False)
         """
@@ -1115,6 +1153,11 @@ class Metabase_API():
             new_card_json['collection_id'] = new_card_collection_id
         else:
             new_card_json['collection_id'] = card_info['collection_id']
+        
+        if new_card_database_id:
+            new_card_json['database_id'] = new_card_database_id
+        else:
+            new_card_json['database_id'] = card_info['database_id']
 
         if return_card:
             return self.create_card(custom_json=new_card_json, verbose=True, return_card=return_card)
